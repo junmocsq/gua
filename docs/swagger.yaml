@@ -1,0 +1,15 @@
+basePath: /
+host: localhost:8080
+info:
+  contact:
+    email: junmocsq@163.com
+    name: 君陌 彩虹豆
+    url: http://www.github.com/junmocsq
+  description: 电商
+  license:
+    name: MIT
+    url: https://github.com/junmocsq/gua/blob/master/LICENSE
+  title: gua
+  version: "1.0"
+paths: {}
+swagger: "2.0"
