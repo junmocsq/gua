@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	jsoniter "github.com/json-iterator/go"
-	"github.com/junmocsq/jlib/jredis"
+	"github.com/sirupsen/logrus"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"io"
@@ -13,17 +13,16 @@ import (
 )
 
 var (
-	redisModule = "sql"
 	expire      = 300
 	emptyString = "MNIL"
 	dbs         map[string]*gorm.DB
 	defaultDb   = "default"
 	dbDebug     = false
-	redis       = jredis.NewRedis(redisModule)
+
+	cacheHandler Cache
 )
 
 func init() {
-	RegisterCacheAccessor("127.0.0.1", "6379", "")
 	dsn := "root:123456@tcp(127.0.0.1:3306)/gua?charset=utf8mb4&parseTime=True&loc=Local"
 	dbs = make(map[string]*gorm.DB)
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
@@ -34,11 +33,9 @@ func init() {
 		panic("failed to connect database")
 	}
 	dbs[defaultDb] = db
+	RegisterCache(NewLocalCache())
 }
 
-func SETModule(module string) {
-	redisModule = module
-}
 func SETExpire(e int) {
 	expire = e
 }
@@ -47,12 +44,6 @@ func Debug(debug ...bool) {
 		dbDebug = debug[0]
 	} else {
 		dbDebug = true
-	}
-}
-func RegisterCacheAccessor(host, port, auth string, debug ...bool) {
-	jredis.RegisterRedisPool(host, port, jredis.ModuleConf(redisModule), jredis.AuthConf(auth), jredis.PrefixConf(redisModule))
-	if len(debug) > 0 {
-		jredis.SetDebug(debug[0])
 	}
 }
 
@@ -64,6 +55,7 @@ type Daoer interface {
 	PrepareSql(sql string, params ...interface{}) Daoer
 	Fetch(result interface{}) error
 	EXEC() (int64, error)
+	Create(data interface{}) (int64, error)
 	ClearCache()
 }
 type Dao struct {
@@ -86,6 +78,7 @@ func NewDb(dbname ...string) *Dao {
 	if dbDebug {
 		db = db.Debug()
 	}
+	//rand.Seed(time.Now().UnixNano())
 	return &Dao{db: db}
 }
 func (d *Dao) DB() *gorm.DB {
@@ -109,9 +102,9 @@ func (d *Dao) PrepareSql(sql string, params ...interface{}) Daoer {
 }
 func (d *Dao) ClearCache() {
 	if d.key != "" {
-		redis.DEL(d.key)
+		cacheHandler.Del(d.key)
 	} else if d.tag != "" {
-		redis.DEL(d.tag)
+		cacheHandler.Del(d.tag)
 	}
 }
 func (d *Dao) clear() {
@@ -126,6 +119,7 @@ func (d *Dao) Fetch(result interface{}) error {
 	if need {
 		res := d.db.Raw(d.sql, d.params...).Scan(result)
 		if res.Error != nil {
+			logrus.Errorf("Fetch err:%s", res.Error)
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
@@ -133,6 +127,9 @@ func (d *Dao) Fetch(result interface{}) error {
 		}
 		d.setCache(result)
 	} else {
+		if strJson == "" {
+			return nil
+		}
 		var json = jsoniter.ConfigCompatibleWithStandardLibrary
 		return json.Unmarshal([]byte(strJson), result)
 	}
@@ -142,6 +139,17 @@ func (d *Dao) Fetch(result interface{}) error {
 func (d *Dao) EXEC() (int64, error) {
 	defer d.clear()
 	res := d.db.Exec(d.sql, d.params...)
+	if res.Error != nil {
+		logrus.Errorf("exec err:%s", res.Error)
+	} else if res.RowsAffected > 0 {
+		d.ClearCache()
+	}
+	return res.RowsAffected, res.Error
+}
+
+func (d *Dao) Create(data interface{}) (int64, error) {
+	defer d.clear()
+	res := d.db.Create(data)
 	if res.Error != nil && res.RowsAffected > 0 {
 		d.ClearCache()
 	}
@@ -156,14 +164,16 @@ func (d *Dao) cache() (result string, needSelectDb bool) {
 	if key == "" {
 		key = d.buildKey()
 	}
-	result = redis.GET(key)
+	result = cacheHandler.Get(key)
 	if result == "" {
 		return "", true
 	}
 	if result == emptyString {
 		result = ""
 	}
-	redis.EXPIRE(key, expire)
+	if time.Now().UnixNano()&2==2{
+		cacheHandler.Expire(key, expire)
+	}
 	return
 }
 
@@ -182,22 +192,25 @@ func (d *Dao) setCache(data interface{}) bool {
 		var json = jsoniter.ConfigCompatibleWithStandardLibrary
 		jsonRes, err := json.Marshal(data)
 		if err != nil {
+			logrus.Errorf("setCache err:%s", err)
 			return false
 		}
 		if len(jsonRes) != 0 {
 			s = string(jsonRes)
 		}
 	}
-	return redis.SETEX(key, s, expire)
+	return cacheHandler.Set(key, s, expire)
 }
 
 func (d *Dao) buildKey() string {
-	tagCache := redis.GET(d.tag)
+	tagCache := cacheHandler.Get(d.tag)
 	if tagCache == "" {
 		tagCache = fmt.Sprintf("%s-%d", d.tag, time.Now().UnixNano())
-		redis.SETEX(d.tag, tagCache, expire)
+		cacheHandler.Set(d.tag, tagCache, expire)
 	} else {
-		redis.EXPIRE(d.tag, expire)
+		if time.Now().UnixNano()&2==2{
+			cacheHandler.Expire(d.tag, expire)
+		}
 	}
 	return md5Hash(tagCache + d.db.Dialector.Explain(d.sql, d.params...))
 }
